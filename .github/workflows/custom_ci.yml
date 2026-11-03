@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'go test package pattern/flags to run; empty runs the full suite'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  module-zip:
+    name: Module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23.0'
+        cache: false
+
+    - name: Build module zip helper
+      run: |
+        set -eux
+        HELPER=$(mktemp -d)
+        cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+        cd "$HELPER"
+        go mod init example.com/mod
+        go get golang.org/x/mod@v0.24.0
+        go build -o "$RUNNER_TEMP/create_mod" .
+
+    - name: Create module zip
+      run: |
+        set -eux
+        mkdir -p "$RUNNER_TEMP/out"
+        # The seal workflow and helper must not ship in the module zip.
+        rm -rf "$GITHUB_WORKSPACE/.github"
+        "$RUNNER_TEMP/create_mod" golang.org/x/crypto v0.35.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.35.0.zip"
+        unzip -l "$RUNNER_TEMP/out/v0.35.0.zip" | tail -n 1
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: module-zip
+        path: ${{ runner.temp }}/out/v0.35.0.zip
+        if-no-files-found: error
+
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go-version: ['1.23.0']
+        include:
+        - os: ubuntu-latest
+          race: '-race'
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go-version }}
+        cache: false
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Build
+      run: |
+        go version
+        go build -v ./...
+
+    - name: Build sshd_test_pw.so for TestMultiAuth (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        # Command from the header of ssh/test/sshd_test_pw.c; without it the
+        # ssh/test TestMultiAuth subtests skip ("sshd_test_pw.so is not available").
+        gcc -Wall -shared -o ssh/test/sshd_test_pw.so -fPIC ssh/test/sshd_test_pw.c
+
+    - name: Run tests
+      run: |
+        set -eux
+        set -o pipefail
+        # macOS runner TMPDIR (/var/folders/...) makes ssh-agent's Unix socket
+        # path exceed the sun_path limit in ssh/agent tests; use a short one.
+        SKIP_ARGS=()
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          export TMPDIR=/tmp
+          # ssh/test tests that open a session on the runner's system sshd. On
+          # the macOS runner sshd-session fails "BSM audit: setaudit_addr failed
+          # ... Could not create new audit session" (non-root runner). Upstream
+          # skips these via skipIfIssue64959 (go.dev/issue/64959) only when the
+          # client error is "unexpected packet in response to channel open";
+          # the same failure intermittently surfaces as "NewSession: EOF"
+          # instead, failing the leg. They run on the Linux leg.
+          SKIP_ARGS=(-skip '^(TestAcceptCloseTCP|TestAcceptCloseUnix|TestAgentForward|TestCiphers|TestDialTCP|TestDialUnix|TestFuncLargeRead|TestKeyChange|TestPortForwardConnectionCloseTCP|TestPortForwardConnectionCloseUnix|TestPortForwardTCP|TestPortForwardUnix|TestRunCommandFailed|TestRunCommandStdin|TestRunCommandStdinError|TestRunCommandSuccess|TestRunCommandWeClosed|TestValidTerminalMode|TestWindowChange)$')
+          echo "macOS: not running ssh/test sshd-session tests (go.dev/issue/64959, BSM audit failure): ${SKIP_ARGS[1]}"
+        fi
+        go test -v ${{ matrix.race }} "${SKIP_ARGS[@]}" ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+    - name: Test summary
+      run: |
+        set -eu
+        LOG="$RUNNER_TEMP/go-test.log"
+        # List every skipped test with its package and the t.Skip message.
+        # Under -v the skip message streams after "=== RUN <test>" (or after
+        # the "--- SKIP" line), so attach message lines to the current test.
+        echo "Skipped tests (package: test -- reason):"
+        # A message containing "skip" wins over later log lines (e.g. sshd
+        # output logged from t.Cleanup); otherwise the last message is used.
+        awk '
+          { sub(/\r$/, "") }
+          /^=== (RUN|CONT|PAUSE|NAME)[ \t]/ { cur=$3; next }
+          /^[ \t]*--- (PASS|FAIL):/ { cur=""; next }
+          /^[ \t]*--- SKIP:/ { cur=$3; if (!(cur in seen)) { seen[cur]=1; order[++n]=cur }; next }
+          /^[ \t]+[A-Za-z0-9_.]+\.go:[0-9]+: / {
+            if (cur != "") {
+              m=$0; sub(/^[ \t]+/, "", m)
+              if (!(cur in smsg)) { msg[cur]=m; if (tolower(m) ~ /skip/) smsg[cur]=m }
+            }
+            next
+          }
+          /^(ok|FAIL|\?)[ \t]/ {
+            for (i = 1; i <= n; i++) {
+              t = order[i]; r = (t in msg) ? msg[t] : "(no message; skipped by parent test)"
+              printf "SKIP %s: %s -- %s\n", $2, t, r
+            }
+            delete seen; delete order; delete msg; delete smsg; n=0; cur=""
+          }
+        ' "$LOG"
+        awk '
+          /^ok[ \t]/ { pok++ }
+          /^FAIL[ \t]/ { pfail++ }
+          /^[ \t]*--- PASS:/ { pass++ }
+          /^[ \t]*--- FAIL:/ { fail++ }
+          /^[ \t]*--- SKIP:/ { skip++ }
+          /^(ok|FAIL|\?)[ \t]/ { print }
+          END {
+            printf "packages ok: %d, packages FAIL: %d\n", pok, pfail
+            printf "tests passed: %d, tests failed: %d, tests skipped: %d\n", pass, fail, skip
+          }
+        ' "$LOG"
